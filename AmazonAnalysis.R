@@ -1,44 +1,174 @@
-library(vroom)
-
-trainData <- vroom("train.csv")
-testData <- vroom("test.csv")
-
+library(tidyverse)
 library(tidymodels)
-library(embed)
-library(ggplot2)
+library(vroom)
+library(doParallel)
 
-# 1. Exploratory Plots
-ggplot(trainData, aes(x = RESOURCE)) +
-  geom_histogram(bins = 30, fill = "blue", color = "black") +
-  labs(title = "Distribution of RESOURCE", x = "RESOURCE", y = "Count")
+# Set up parallelization
+num_cores <- 4
+cl <- makePSOCKcluster(num_cores)
 
-ggplot(trainData, aes(x = factor(ACTION))) +
-  geom_bar(fill = "orange") +
-  labs(title = "Count of ACTION (0 vs 1)", x = "ACTION", y = "Count")
+# Read the data
+train_dirty <- vroom("train.csv") %>%
+  mutate(ACTION = factor(ACTION))
+test_dirty <- vroom("test.csv")
 
-# 2. Create Recipe
-target_var <- "ACTION"  
-# Numeric features to convert to factors
-vars_I_want_to_mutate <- c("RESOURCE", "MGR_ID", "ROLE_ROLLUP_1")
-# Categorical variables to combine rare categories
-vars_I_want_other_cat_in <- c("ROLE_TITLE", "ROLE_FAMILY_DESC")
-# Categorical variables for dummy variable encoding
-vars_I_want_to_dummy <- c("ROLE_DEPTNAME", "ROLE_FAMILY")
-# Categorical variable for target encoding
-vars_I_want_to_target_encode <- c("ROLE_ROLLUP_2")
+# Make a recipe
+recipe <- recipe(ACTION ~ ., data = train_dirty) %>%
+  step_mutate_at(all_double_predictors(), fn = factor) %>%
+  step_other(all_nominal_predictors(), threshold = 0.001) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+prepped_recipe <- prep(recipe)
+clean_data <- bake(prepped_recipe, new_data = train_dirty)
 
-# Recipe definition
-my_recipe <- recipe(as.formula(paste(target_var, "~ .")), data = trainData) %>%
-  step_mutate_at(all_of(vars_I_want_to_mutate), fn = factor) %>%  # Convert numeric features to factors
-  step_mutate_at(all_of(vars_I_want_other_cat_in), fn = factor) %>%  # Convert other categorical features to factors
-  step_mutate_at(all_of(vars_I_want_to_dummy), fn = factor) %>%  # Convert dummy variable candidates to factors
-  step_mutate_at(all_of(vars_I_want_to_target_encode), fn = factor) %>%  # Convert target encoding variable to factor
-  step_other(all_of(vars_I_want_other_cat_in), threshold = 0.001) %>%  # Combine rare categories
-  step_dummy(all_of(vars_I_want_to_dummy)) %>%  # Dummy variable encoding
-  step_lencode_mixed(all_of(vars_I_want_to_target_encode), outcome = vars(target_var))  # Target encoding
+# Create folds in the data
+folds <- vfold_cv(train_dirty, v = 10, repeats = 1)
 
-# 3. Preprocess the Data
-prep <- prep(my_recipe)
-baked <- bake(prep, new_data = trainData)
+#######################
+# Logistic Regression #
+#######################
 
-glimpse(baked)  
+# Create a model
+logistic_model <- logistic_reg() %>%
+  set_engine("glm")
+
+# Create the workflow
+logistic_workflow <- workflow() %>%
+  add_model(logistic_model) %>%
+  add_recipe(recipe)
+
+# Fit and make predictions
+logistic_fit <- fit(logistic_workflow, data = train_dirty)
+logistic_predictions <- predict(logistic_fit,
+                                new_data = test_dirty,
+                                type = "prob")$.pred_1
+
+# Write output
+logistic_output <- tibble(id = test_dirty$id,
+                          Action = logistic_predictions)
+vroom_write(logistic_output, "logistic_regression.csv", delim = ",")
+
+#################################
+# Penalized Logistic Regression #
+#################################
+
+# Create a model
+penalized_model <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet")
+
+# Create the workflow
+penalized_workflow <- workflow() %>%
+  add_model(penalized_model) %>%
+  add_recipe(recipe)
+
+# Set up parallelization
+registerDoParallel(cl)
+
+# Tuning
+penalized_tuning_grid <- grid_regular(penalty(), mixture(), levels = 5)
+penalized_cv_results <- penalized_workflow %>%
+  tune_grid(resamples = folds,
+            grid = penalized_tuning_grid,
+            metrics = metric_set(roc_auc))
+
+stopCluster(cl)
+
+# Get the best tuning parameters
+penalized_besttune <- penalized_cv_results %>%
+  select_best(metric = "roc_auc")
+
+# Fit and make predictions
+penalized_fit <- penalized_workflow %>%
+  finalize_workflow(penalized_besttune) %>%
+  fit(data = train_dirty)
+penalized_predictions <- predict(penalized_fit,
+                                 new_data = test_dirty,
+                                 type = "prob")$.pred_1
+
+# Write output
+penalized_output <- tibble(id = test_dirty$id,
+                           Action = penalized_predictions)
+vroom_write(penalized_output, "penalized_logistic_regression.csv", delim = ",")
+
+#######################
+# K-Nearest Neighbors #
+#######################
+
+# Create a model
+knn_model <- nearest_neighbor(neighbors = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("kknn")
+
+# Create the workflow
+knn_workflow <- workflow() %>%
+  add_model(knn_model) %>%
+  add_recipe(recipe)
+
+# Set up parallelization
+registerDoParallel(cl)
+
+# Tuning
+knn_tuning_grid <- grid_regular(neighbors(), levels = 5)
+knn_cv_results <- knn_workflow %>%
+  tune_grid(resamples = folds,
+            grid = knn_tuning_grid,
+            metrics = metric_set(roc_auc))
+stopCluster(cl)
+
+# Get the best tuning parameters
+knn_besttune <- knn_cv_results %>%
+  select_best(metric = "roc_auc")
+
+# fit and make predictions
+knn_fit <- knn_workflow %>%
+  finalize_workflow(knn_besttune) %>%
+  fit(data = train_dirty)
+knn_predictions <- predict(knn_fit,
+                           new_data = test_dirty,
+                           type = "prob")$.pred_1
+
+# Write output
+knn_output <- tibble(id = test_dirty$id,
+                     Action = knn_predictions)
+vroom_write(knn_output, "knn_model.csv", delim = ",")
+
+#################
+# Random Forest #
+#################
+
+# Create a model
+forest_model <- rand_forest(min_n = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("ranger")
+
+# Create the workflow
+forest_workflow() %>%
+  add_model(forest_model) %>%
+  add_recipe(recipe)
+
+# Set up parallelization
+registerDoParallel(cl)
+
+# Tuning
+forest_tuning_grid <- grid_regular(min_n(), levels = 20)
+forest_cv_results <- forest_workflow %>%
+  tune_grid(resamples = folds,
+            grid = forest_tuning_grid,
+            metrics = metric_set(roc_auc))
+
+# Get the best tuning parameters
+forest_besttune <- forest_cv_results %>%
+  select_best(metric = "roc_auc")
+
+# Fit and make predictions
+forest_fit <- forest_workflow %>%
+  finalize_workflow(forest_besttune) %>%
+  fit(data = train_dirty)
+forest_predictions <- predict(forest_fit,
+                              new_data = test_dirty,
+                              type = "prob")$.pred_1
+
+# Write output
+forest_output <- tibble(id = test_dirty$id,
+                        Action = forest_output)
+vroom_write(forest_output, "random_forest.csv", delim = ",")
